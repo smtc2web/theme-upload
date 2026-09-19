@@ -1,0 +1,138 @@
+name: Publish theme
+
+on:
+  workflow_call:
+    inputs:
+      store-url:
+        description: 主题商店地址
+        required: false
+        type: string
+        default: https://themes.smtc2web.org
+      folder:
+        description: ZIP 内的顶层文件夹名（默认使用仓库名）
+        required: false
+        type: string
+        default: ""
+      source-dir:
+        description: 打包的源目录，需包含 theme.toml（相对仓库根目录）
+        required: false
+        type: string
+        default: "."
+      build-command:
+        description: 打包前执行的构建命令（可选，在 source-dir 中执行）
+        required: false
+        type: string
+        default: ""
+      strict-version:
+        description: 打 tag 触发时校验 tag（去掉 v 前缀）与 theme.toml 的 version 一致
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      slug:
+        description: 主题在商店中的标识
+        value: ${{ jobs.publish.outputs.slug }}
+      version:
+        description: 本次发布的版本
+        value: ${{ jobs.publish.outputs.version }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      slug: ${{ steps.publish.outputs.slug }}
+      version: ${{ steps.publish.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 构建主题
+        if: inputs.build-command != ''
+        working-directory: ${{ inputs.source-dir }}
+        run: ${{ inputs.build-command }}
+
+      - name: 校验 theme.toml
+        working-directory: ${{ inputs.source-dir }}
+        run: |
+          if [ ! -f theme.toml ]; then
+            echo "::error::根目录缺少 theme.toml 文件"
+            exit 1
+          fi
+          if ! grep -q '^\[smtc2web\.theme\]' theme.toml; then
+            echo "::error::theme.toml 缺少 [smtc2web.theme] 配置节"
+            exit 1
+          fi
+          VERSION=$(awk -F'=' '
+            /^\[smtc2web\.theme\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 ~ /^[[:space:]]*version[[:space:]]*$/ {
+              gsub(/[[:space:]"]/, "", $2); print $2; exit
+            }
+          ' theme.toml)
+          if [ -z "$VERSION" ]; then
+            echo "::error::theme.toml 缺少 version 字段"
+            exit 1
+          fi
+          echo "THEME_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "主题版本：$VERSION"
+          if [ "${{ inputs.strict-version }}" = "true" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VERSION" != "$VERSION" ]; then
+              echo "::error::tag $GITHUB_REF_NAME 与 theme.toml 中的 version $VERSION 不一致"
+              exit 1
+            fi
+          fi
+
+      - name: 打包 ZIP
+        run: |
+          FOLDER="${{ inputs.folder }}"
+          if [ -z "$FOLDER" ]; then
+            FOLDER="$(basename "$GITHUB_REPOSITORY")"
+          fi
+          rm -rf /tmp/theme-package
+          mkdir -p "/tmp/theme-package/$FOLDER"
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'node_modules' "${{ inputs.source-dir }}/" "/tmp/theme-package/$FOLDER/"
+          (cd /tmp/theme-package && zip -qr theme.zip "$FOLDER")
+          echo "打包完成：$(du -h /tmp/theme-package/theme.zip | cut -f1)"
+
+      - name: 发布到主题商店
+        id: publish
+        env:
+          STORE_URL: ${{ inputs.store-url }}
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ] || [ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+            echo "::error::无法获取 OIDC Token，请在调用工作流中声明 permissions: id-token: write"
+            exit 1
+          fi
+          OIDC_RESPONSE=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=smtc2web-themes")
+          OIDC_TOKEN=$(echo "$OIDC_RESPONSE" | jq -r '.value // empty')
+          if [ -z "$OIDC_TOKEN" ]; then
+            echo "::error::获取 OIDC Token 失败：$OIDC_RESPONSE"
+            exit 1
+          fi
+
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' \
+            -X POST "$STORE_URL/api/actions/publish" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -F "file=@/tmp/theme-package/theme.zip;type=application/zip")
+          cat "$RESPONSE_FILE"
+          echo
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::发布失败（HTTP $HTTP_CODE）"
+            exit 1
+          fi
+          SLUG=$(jq -r '.slug' "$RESPONSE_FILE")
+          VERSION=$(jq -r '.version' "$RESPONSE_FILE")
+          PAGE_URL=$(jq -r '.page_url' "$RESPONSE_FILE")
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 主题已发布"
+            echo
+            echo "- 主题：$SLUG"
+            echo "- 版本：$VERSION"
+            echo "- 页面：$PAGE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

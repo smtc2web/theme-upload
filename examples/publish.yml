@@ -1,0 +1,22 @@
+name: Publish theme
+
+# 把本文件复制到你的主题仓库的 .github/workflows/publish.yml，
+# 推送 v* tag（或在 Actions 页面手动触发）即可自动发布到主题商店。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      id-token: write # 必需：用于获取 GitHub Actions OIDC Token
+    uses: smtc2web/theme-upload/.github/workflows/publish.yml@v1
+    # 如需构建（例如主题由源码编译产出），取消注释并按需修改：
+    # with:
+    #   build-command: pnpm install && pnpm build
+    #   source-dir: dist
+    #   folder: my-theme
